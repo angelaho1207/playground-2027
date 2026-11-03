@@ -7,22 +7,23 @@ import subprocess
 import datetime
 import zipfile
 import jinja2
-import socket
 import random
 import json
+import types
+import importlib.util
+from contextlib import contextmanager
 
 from backports import tempfile
 
 from server import celery_app, app, db, socketio, redis
 from server.models import Bot, Team, Game, GameStatus
 from server.helpers import get_s3_object
-from server.pokerbots_parser.runner import Runner
-from server.bot import Player
+from server.bot import Table
 
 from sqlalchemy.orm import raiseload
 
 DEPS_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, 'deps'))
-ENGINE_PATH = os.path.join(DEPS_PATH, 'engine-2026', 'engine.py')
+ENGINE_PATH = os.path.join(DEPS_PATH, 'engine-2027', 'engine.py')
 
 
 # A large portion of this code is copied from mitpokerbots/scrimmage/scrimmage/tasks.py
@@ -120,51 +121,54 @@ def _get_environment():
   return base
 
 
-def write_config(game_dir, bot_dir):
-  with open(os.path.join(game_dir, 'config.py'), 'w') as config_file:
-    config_txt = render_template('config.txt', bot_path=bot_dir)
-    config_file.write(config_txt)
+@contextmanager
+def _bot_environment():
+  '''
+  Hides the worker's config (secrets included) from os.environ while the engine
+  builds and starts the bots, since their processes inherit it.
+  '''
+  hidden = {key: os.environ.pop(key) for key in app.config.keys() if key in os.environ}
+  try:
+    yield
+  finally:
+    os.environ.update(hidden)
 
-def create_runner(bot, host, port):
-    try:
-        sock = socket.create_connection((host, port))
-    except socket.error as e:
-        print('Error connecting to {}:{}. Aborting. The exact error was {}'.format(host, port, e))
-        return None, None
 
-    socketfile = sock.makefile('rw')
-    runner = Runner(bot, socketfile)
-    return runner, sock
+def load_engine(bot_dir):
+  '''
+  Imports a fresh copy of the engine, which reads its settings with `from config import *`.
+  '''
+  config = types.ModuleType('config')
+  exec(render_template('config.txt', bot_path=bot_dir), config.__dict__)
+  sys.modules['config'] = config
+  spec = importlib.util.spec_from_file_location('engine', ENGINE_PATH)
+  engine = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(engine)
+  return engine
+
 
 def run_bot_and_game(game, tmp_dir, bot_dir):
   game_dir = os.path.join(tmp_dir, 'game')
   os.mkdir(game_dir)
-  write_config(game_dir, bot_dir)
-  engine_process = subprocess.Popen(['python', ENGINE_PATH], cwd=game_dir, env=_get_environment())
+  engine = load_engine(bot_dir)
+  game.send_message({
+    'status': 'starting_game'
+  })
+  pubsub = redis.pubsub()
+  pubsub.subscribe(game.uuid)
+  table = Table(engine, game, pubsub, bot_dir)
+  worker_dir = os.getcwd()
+  os.chdir(game_dir)  # the engine writes the bots' logs to the working directory
   try:
-    game.send_message({
-      'status': 'starting_game'
-    })
-    # Give the Java VM some time to start up.
-    time.sleep(2)
-    pubsub = redis.pubsub()
-    pubsub.subscribe(game.uuid)
-    player = Player(db_game=game, pubsub=pubsub)
-    runner, sock = create_runner(player, 'localhost', 4514)
-    if runner is None or sock is None:
-      os.listdir(game_dir)
-      os.listdir(bot_dir)
-      os.listdir(tmp_dir)
-      raise Exception("Couldn't connect to socket")
-    player.set_sock(sock)
-    runner.run()
-  except socket.error:
-    pass
+    with _bot_environment():
+      table.start_bots()
+    table.play()
   finally:
-    engine_process.kill()
-    engine_process.wait()
+    table.stop_bots()
+    os.chdir(worker_dir)
+    pubsub.close()
 
-  return "The game is done! Your final bankroll: {}".format(player.bankroll)
+  return "The game is done! Your team's final bankroll: {}".format(table.team_bankroll('A'))
 
 
 def play_live_game(game):

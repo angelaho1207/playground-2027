@@ -75,10 +75,12 @@ class Home extends Component {
         <Container text>
           <Header as='h2' style={{ paddingTop: "2em" }}>
             Welcome to the Pokerbots Playground!
-            <Header.Subheader>Here, you play human-vs-bot heads up hold'em against the bots on the scrimmage server.</Header.Subheader>
+            <Header.Subheader>Here, you play Homie Hold'em against the bots on the scrimmage server.</Header.Subheader>
           </Header>
           <p>
-            Simply select a bot to play against below, and you'll be connected.
+            Your team sits at a table of four: you play both of your team's seats,
+            which sit across from each other, and two copies of the bot you
+            choose play the other two. Select a bot below, and you'll be connected.
           </p>
           { this.state.teams == null && (
             <Segment placeholder>

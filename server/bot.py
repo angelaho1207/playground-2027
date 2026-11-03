@@ -1,368 +1,265 @@
-from server.pokerbots_parser.actions import  FoldAction, CallAction, CheckAction, RaiseAction, DiscardAction
-from server.pokerbots_parser.bot import Bot
-import socket
-import time
-import random
+'''
+Plays a Homie Hold'em game between a human in the browser and a bot.
+
+The human's team is A and controls both of its seats, A1 and A2, which sit
+opposite each other. The selected bot plays both B seats as ordinary engine
+players. The worker drives the stock engine's Game.run_round itself, so every
+query reaches us with the full RoundState.
+'''
 import json
 
-def pot_to_json(pot):
-    return {
-        'pip': pot.pip,
-        'bets': pot.bets,
-        'num_exchanges': pot.num_exchanges,
-        'exchanges': pot.exchanges,
-        'total': pot.total,
-        'opponent_bets': pot.opponent_bets,
-        'opponent_num_exchanges': pot.opponent_num_exchanges,
-        'opponent_exchanges': pot.opponent_exchanges,
-        'opponent_total': pot.opponent_total,
-        'grand_total': pot.grand_total
-    }
+HUMAN_TEAM = 'A'
+# Seats are renumbered every round, counting from the small blind.
+POSITIONS = ['SB', 'BB', 'UTG', 'BTN']
+STREET_NAMES = {0: 'Preflop', 3: 'Flop', 4: 'Turn', 5: 'River'}
 
-def move_history_to_json(move_history):
-    history = []
-    for move in move_history:
-        data = move.split(':')
-        d = {
-            'type': data[0],
-            'player': 'table' if data[0] == 'DEAL' else ('hero' if data[-1] == 'A' else 'bot')
-        }
-        if data[0] in ['POST', 'BET', 'RAISE']:
-            d['amount'] = int(data[1])
-        elif data[0] == 'SHOW':
-            d['cards'] = data[1:3]
-        elif data[0] == 'DEAL':
-            d['street'] = data[1]
-        elif data[0] == 'DISCARD':
-            d['card'] = data[1]
-        history.append(d)
-    return history
 
-def legal_moves_to_json(legal_moves, min_amount, max_amount, continue_cost):
-    moves = []
-    for cls in legal_moves:
-        d = {
-            'type': cls.__name__[:-6].upper(),
-        }
-        if cls is RaiseAction:
-            d['min'] = min_amount
-            d['max'] = max_amount
-            d['base_cost'] = 0
-        elif cls is CallAction:
-            d['base_cost'] = continue_cost
-        elif cls is DiscardAction:
-            d['base_cost'] = 0
-        else:
-            d['base_cost'] = 0
-        moves.append(d)
-    return sorted(moves, key=lambda m: ('min' in m, m['type']))
+class HumanSeat():
+    '''
+    Stands in for an engine Player: the engine queries it like a bot, and it
+    asks the browser instead.
+    '''
 
-class Player(Bot):
-    def __init__(self, db_game, pubsub):
-        self.db_game = db_game
-        self.sock = None
-        self.done = False
+    def __init__(self, table, name):
+        self.table = table
+        self.name = name
         self.bankroll = 0
-        self.opponent_bankroll = 0
+
+    def query(self, round_state, player_message, game_log):
+        if isinstance(round_state, self.table.engine.TerminalState):
+            self.table.handle_round_over(round_state)
+            return self.table.engine.CheckAction()
+        return self.table.get_human_action(round_state)
+
+
+class BotSeat():
+    '''
+    Wraps an engine Player so the browser sees each of the bot's actions.
+    '''
+
+    def __init__(self, table, player):
+        self.table = table
+        self.player = player
+        self.name = player.name
+        self.bankroll = 0
+
+    def query(self, round_state, player_message, game_log):
+        action = self.player.query(round_state, player_message, game_log)
+        if isinstance(round_state, self.table.engine.RoundState):
+            self.table.handle_bot_action(round_state, action)
+        return action
+
+
+class Table():
+    '''
+    Runs one playground game and relays it to the browser.
+    '''
+
+    def __init__(self, engine, db_game, pubsub, bot_path):
+        self.engine = engine
+        self.db_game = db_game
         self.pubsub = pubsub
-        self.past_moves = []
-        self.current_street = 0
+        self.game = engine.Game()
+        self.bots = [engine.Player(name, bot_path) for name in ('B1', 'B2')]
+        # teams alternate around the table: A1 B1 A2 B2
+        self.seats = [HumanSeat(self, 'A1'), BotSeat(self, self.bots[0]),
+                      HumanSeat(self, 'A2'), BotSeat(self, self.bots[1])]
+        self.round_num = 0
+        self.round_over_sent = False
+        self.decision_id = 0
+        self.done = False
 
-    def set_sock(self, sock):
-        self.sock = sock
+    def start_bots(self):
+        for bot in self.bots:
+            bot.build()
+        for bot in self.bots:
+            bot.run()
 
-    def force_shutdown(self):
-        self.done = True
-        self.sock.shutdown(socket.SHUT_RDWR)
-        self.sock.close()
+    def stop_bots(self):
+        for bot in self.bots:
+            bot.stop()
 
-    def handle_new_game(self, new_game):
+    def play(self):
+        for round_num in range(1, self.engine.NUM_ROUNDS + 1):
+            self.round_num = round_num
+            self.round_over_sent = False
+            self.game.run_round(self.seats)
+            if self.done:
+                break
+            self.seats = self.seats[1:] + self.seats[:1]  # the button moves one seat to the left
+
+    def team_bankroll(self, team):
+        return sum(seat.bankroll for seat in self.seats if seat.name[:-1] == team)
+
+    def default_action(self, round_state):
+        engine = self.engine
+        return engine.CheckAction() if engine.CheckAction in round_state.legal_actions() else engine.FoldAction()
+
+    def wait_for_message(self):
         '''
-        Called when a new game starts. Called exactly once.
-
-        Arguments:
-        new_game: the pokerbots.Game object.
-
-        Returns:
-        Nothing.
+        Returns the next message from the browser, skipping pings. Returns None
+        if the browser quit or stopped pinging, and ends the game.
         '''
-        pass
-
-    def handle_new_round(self, game_state, round_state, active):
-        '''
-        Called when a new round starts. Called NUM_ROUNDS times.
-
-        Arguments:
-        game_state: the GameState object.
-        round_state: the RoundState object.
-        active: your player's index.
-
-        Returns:
-        Nothing.
-        '''
-        self.bankroll = game_state.bankroll
-        self.opponent_bankroll = -1 * game_state.bankroll
-        self.past_moves = []
-        self.current_street = 0
-
-        if game_state.round_num > 100:
-            return self.force_shutdown()
-        
-        # Determine who posts the small and big blinds based on the active player
-        if active == 0:
-            # Hero is the small blind, bot is the big blind
-            self.past_moves.append('POST:1:A')   # Hero posts small blind of 1
-            self.past_moves.append('POST:2:bot') # Opponent posts big blind of 2
-        else:
-            # Bot is the small blind, hero is the big blind
-            self.past_moves.append('POST:1:bot') # Opponent posts small blind of 1
-            self.past_moves.append('POST:2:A')   # Hero posts big blind of 2
-
-    def handle_round_over(self, game_state, terminal_state, active):
-        '''
-        Called when a round ends. Called NUM_ROUNDS times.
-
-        Arguments:
-        game_state: the GameState object.
-        terminal_state: the TerminalState object.
-        active: your player's index.
-
-        Returns:
-        Nothing.
-        '''
-
-        my_delta = terminal_state.deltas[active]  # your bankroll change from this round
-        previous_state = terminal_state.previous_state  # RoundState before payoffs
-        street = previous_state.street  # 0, 3, 4, or 5 representing when this round ended
-        my_cards = previous_state.hands[active]  # your cards
-        opp_cards = previous_state.hands[1-active]  # opponent's cards or [] if not revealed
-
-        if self.done:
-            return
-
-        board_cards = previous_state.board  # the board cards
-        my_pip = previous_state.pips[active]  # the number of chips you have contributed to the pot this round of betting
-        my_stack = previous_state.stacks[active]  # the number of chips you have remaining
-        opp_stack = previous_state.stacks[1-active]  # the number of chips your opponent has remaining
-        
-        my_contribution = 400 - my_stack  # the number of chips you have contributed to the pot
-        opp_contribution = 400 - opp_stack  # the number of chips your opponent has contributed to the pot
-
-        # if self.current_street != street:
-        #     self.current_street = street
-        #     self.past_moves.append('DEAL:' + ('Flop' if street == 3 else ('Turn' if street == 4 else 'River')))
-        if 'POST:1:bot' in self.past_moves and self.past_moves[-1][:6] == 'CHECK:' and self.past_moves[-1][-2:] == ':A' and my_contribution == opp_contribution:
-            self.past_moves.append('CHECK:bot')
-        if self.past_moves[-1][:6] == 'RAISE:' and self.past_moves[-1][-2:] == ':A' and my_contribution == opp_contribution:
-            self.past_moves.append('CALL:bot')
-        if not opp_cards and my_delta > 0:
-            self.past_moves.append('FOLD:bot')
-
-        pot = {
-            'pip': my_pip,
-            'bets': my_contribution,
-            'total': my_contribution,
-            'opponent_bets': opp_contribution,
-            'opponent_total': opp_contribution,
-            'grand_total': my_contribution + opp_contribution
-        }
-
-        self.db_game.send_message({
-            'status': 'round_over',
-            'round_num': game_state.round_num,
-            'bankroll': self.bankroll,
-            'new_bankroll': game_state.bankroll,
-            'opponent_bankroll': self.opponent_bankroll,
-            'new_opponent_bankroll': -1*game_state.bankroll,
-            'pot': pot,
-            'cards': my_cards,
-            'opponent_cards': opp_cards if opp_cards else (['??'] * len(previous_state.hands[1-active])),
-            'board_cards': board_cards,
-            'result': ('win' if my_delta > 0 else ('loss' if my_delta < 0 else 'tie')),
-            'move_history': move_history_to_json(self.past_moves)
-        })
-
         while True:
             message = self.pubsub.get_message(timeout=30)
-            if message is None:
-                break
-            if message['data'].decode("utf-8") == 'quit_game':
-                self.force_shutdown()
-                break
-            if (message['data'].decode("utf-8") == 'next_hand'):
-                break
-
-    def get_action(self, game_state, round_state, active):
-        '''
-        Where the magic happens - your code should implement this function.
-        Called any time the engine needs an action from your bot.
-
-        Arguments:
-        game_state: the GameState object.
-        round_state: the RoundState object.
-        active: your player's index.
-
-        Returns:
-        Your action.
-        '''
-        if self.done:
-            return
-        street = round_state.street
-        legal_actions = round_state.legal_actions()
-
-        my_pip = round_state.pips[active]
-        min_raise, max_raise = round_state.raise_bounds()
-        min_cost = min_raise - my_pip  # the cost of a minimum bet/raise
-        max_cost = max_raise - my_pip  # the cost of a maximum bet/raise
-
-        street = round_state.street  # 0, 3, 4, or 5 representing pre-flop, flop, turn, or river respectively
-        my_cards = round_state.hands[active]  # your cards
-        board_cards = round_state.board  # the board cards
-        opp_pip = round_state.pips[1-active]  # the number of chips your opponent has contributed to the pot this round of betting
-        my_stack = round_state.stacks[active]  # the number of chips you have remaining
-        opp_stack = round_state.stacks[1-active]  # the number of chips your opponent has remaining
-        continue_cost = opp_pip - my_pip  # the number of chips needed to stay in the pot
-        my_contribution = 400 - my_stack  # the number of chips you have contributed to the pot
-        opp_contribution = 400 - opp_stack  # the number of chips your opponent has contributed to the pot
-
-        # Check for opponent's call before dealing a new street
-        if self.current_street != street:
-            # Log opponent's call if they matched your bet before the new street
-            if 'POST:1:A' in self.past_moves and self.current_street == 0: # you are small blind
-                if my_contribution == 2:
-                    self.past_moves.append('CHECK:bot')
-            if (self.past_moves[-1][:6] == 'RAISE:' and self.past_moves[-1][-2:] == ':A'):
-                    self.past_moves.append('CALL:bot')
-            elif ('POST:1:bot' in self.past_moves and self.past_moves[-1][:6] == 'CHECK:' and self.past_moves[-1][-2:] == ':A' and self.current_street > 0): # you are big blind
-                self.past_moves.append('CHECK:bot')
-            
-            self.current_street = street
-            
-            # Handle street names for discard phase
-            if street == 2:
-                self.past_moves.append('DEAL:Discard 1')
-            elif street == 3:
-                self.past_moves.append('DEAL:Discard 2')
-            elif street == 4:
-                self.past_moves.append('DEAL:Turn')
-            elif street == 5:
-                self.past_moves.append('DEAL:River')
-
-            if continue_cost == 0:
-                if 'POST:1:A' in self.past_moves:  # If you are the small blind, opponent (big blind) acts first post-flop
-                    self.past_moves.append('CHECK:bot')
-
-        # Log actions during the current street
-        if my_contribution != 1 and continue_cost > 0:
-            if opp_pip == my_pip: # should never happen? if conitnue cost > 0 then they could not have called.
-                self.past_moves.append('CALL:bot')
-            elif opp_pip > my_pip:
-                self.past_moves.append('RAISE:' + str(opp_pip) + ':bot')
-
-        if street == 0 and continue_cost == 0 and my_contribution == 2:
-            self.past_moves.append('CALL:bot')
-
-        pot = {
-            'pip': my_pip,
-            'bets': my_contribution,
-            'total': my_contribution,
-            'opponent_bets': opp_contribution,
-            'opponent_total': opp_contribution,
-            'grand_total': my_contribution + opp_contribution
-        }
-
-        # Check if it's discarding
-        in_discard_phase = street in [2, 3]
-        num_hole_cards = len(round_state.hands[active])
-
-        # Opponent card count - start with 3, infer from board and street
-        opponent_num_cards = 3  # Everyone starts with 3 cards
-
-        if street == 2:
-            if active == 0:
-                opponent_num_cards = 3 
-            else:
-                opponent_num_cards = 3
-        elif street == 3:
-            if active == 0:
-                opponent_num_cards = 2
-            else:
-                opponent_num_cards = 2  # You already discarded
-        elif street >= 4:
-            opponent_num_cards = 2
-
-        opponent_cards = ['??'] * opponent_num_cards     
-
-        # Track discarded cards
-        discarded_cards = []
-        if len(board_cards) > 2:
-            if len(board_cards) == 3:
-                # Only first player has discarded
-                discarded_cards = [board_cards[2]]
-            elif len(board_cards) >= 4:
-                # Both players have discarded
-                discarded_cards = board_cards[2:4]
-
-        self.db_game.send_message({
-            'status': 'get_action',
-            'round_num': game_state.round_num,
-            'bankroll': game_state.bankroll,
-            'opponent_bankroll': -1 * game_state.bankroll,
-            'pot': pot,
-            'cards': round_state.hands[active],
-            'opponent_cards': opponent_cards,
-            'board_cards': board_cards,
-            'move_history': move_history_to_json(self.past_moves),
-            'legal_moves': legal_moves_to_json(legal_actions, min_raise, max_raise, continue_cost),
-            'in_discard_phase': in_discard_phase,  
-            'num_hole_cards': num_hole_cards, 
-            'discarded_cards': discarded_cards,  
-            'street_name': ('Preflop' if street == 0 else 
-                        'Discard 1' if street == 2 else 
-                        'Discard 2' if street == 3 else 
-                        'Turn' if street == 4 else 
-                        'River' if street == 5 else 'Showdown')
-        })
-
-        while True:
-            message = self.pubsub.get_message(timeout=30)
-            if message is None:
-                # None message, therefore timeout
-                self.force_shutdown()
-                return FoldAction()
-
+            if message is None:  # no pings, so the browser is gone
+                self.done = True
+                return None
             if message.get('type') == 'subscribe':
                 continue
+            data = message['data'].decode('utf-8')
+            if data == 'quit_game':
+                self.done = True
+                return None
+            if data != 'ping':
+                return data
 
-            if (message['data'].decode("utf-8") == 'quit_game'):
-                self.force_shutdown()
-                return FoldAction()
-
-            if message['data'].decode("utf-8") == 'ping':
-                continue
-
+    def get_human_action(self, round_state):
+        if self.done:
+            return self.default_action(round_state)
+        self.decision_id += 1
+        self.send(round_state, 'get_action', decision_id=self.decision_id,
+                  legal_moves=self.legal_moves(round_state))
+        while True:
+            data = self.wait_for_message()
+            if data is None:
+                return self.default_action(round_state)
             try:
-                data = json.loads(message['data'])
-            except:
-                return FoldAction()
+                move = json.loads(data)
+            except ValueError:
+                continue  # a stray next_hand
+            if move.get('decision_id') != self.decision_id:
+                continue  # a late click on an earlier decision
+            action = self.parse_move(round_state, move)
+            if action is not None:
+                return action
 
-            if data['type'] == 'FOLD':
-                self.past_moves.append('FOLD:A')
-                return FoldAction()
-            elif data['type'] == 'CHECK':
-                self.past_moves.append('CHECK:A')
-                return CheckAction()
-            elif data['type'] == 'CALL':
-                self.past_moves.append('CALL:A')
-                return CallAction()
-            elif data['type'] == 'RAISE':
-                self.past_moves.append(f'RAISE:{data["amount"]}:A')
-                return RaiseAction(amount=data['amount'])
-            elif data['type'] == "DISCARD":
-                card_index = data['card_index']
-                discarded_card = round_state.hands[active][card_index]
-                self.past_moves.append(f'DISCARD:{discarded_card}:A')
-                return DiscardAction(card=card_index)
+    def parse_move(self, round_state, move):
+        engine = self.engine
+        legal_actions = round_state.legal_actions()
+        action_types = {'FOLD': engine.FoldAction, 'CHECK': engine.CheckAction,
+                        'CALL': engine.CallAction, 'RAISE': engine.RaiseAction}
+        action_type = action_types.get(move.get('type'))
+        if action_type not in legal_actions:
+            return None
+        if action_type is engine.RaiseAction:
+            min_raise, max_raise = round_state.raise_bounds()
+            try:
+                amount = int(move['amount'])
+            except (KeyError, TypeError, ValueError):
+                return None
+            return engine.RaiseAction(amount) if min_raise <= amount <= max_raise else None
+        return action_type()
 
+    def handle_bot_action(self, round_state, action):
+        if self.done:
+            return
+        next_state = round_state.proceed(action)
+        if isinstance(next_state, self.engine.RoundState):  # otherwise the round-over message shows it
+            self.send(next_state, 'bot_action')
+
+    def handle_round_over(self, terminal_state):
+        '''
+        Shows the result and waits for the next hand. Both human seats are
+        queried at the end of the round; only the first one does anything.
+        '''
+        if self.round_over_sent or self.done:
+            return
+        self.round_over_sent = True
+        deltas = terminal_state.deltas
+        team_delta = sum(delta for seat, delta in zip(self.seats, deltas) if seat.name[:-1] == HUMAN_TEAM)
+        self.send(terminal_state.previous_state, 'round_over', deltas=deltas,
+                  result='win' if team_delta > 0 else ('loss' if team_delta < 0 else 'tie'),
+                  team_delta=team_delta,
+                  new_team_bankrolls={team: self.team_bankroll(team) + sum(
+                      delta for seat, delta in zip(self.seats, deltas) if seat.name[:-1] == team)
+                      for team in ('A', 'B')})
+        while True:
+            data = self.wait_for_message()
+            if data is None or data == 'next_hand':
+                return
+
+    def legal_moves(self, round_state):
+        engine = self.engine
+        legal_actions = round_state.legal_actions()
+        active = round_state.active
+        top = max(round_state.pips)
+        moves = []
+        if engine.FoldAction in legal_actions:
+            moves.append({'type': 'FOLD', 'cost': 0})
+        if engine.CheckAction in legal_actions:
+            moves.append({'type': 'CHECK', 'cost': 0})
+        if engine.CallAction in legal_actions:
+            moves.append({'type': 'CALL', 'cost': min(top - round_state.pips[active], round_state.stacks[active])})
+        if engine.RaiseAction in legal_actions:
+            min_raise, max_raise = round_state.raise_bounds()
+            moves.append({'type': 'BET' if top == 0 else 'RAISE', 'min': min_raise, 'max': max_raise,
+                          'pip': round_state.pips[active]})
+        return moves
+
+    def action_history(self, round_state):
+        '''
+        Rebuilds the round's actions from the chain of previous states.
+        '''
+        chain = []
+        state = round_state
+        while state is not None:
+            chain.append(state)
+            state = state.previous_state
+        chain.reverse()
+        names = [seat.name for seat in self.seats]
+        history = [{'type': 'POST', 'player': names[0], 'amount': self.engine.SMALL_BLIND},
+                   {'type': 'POST', 'player': names[1], 'amount': self.engine.BIG_BLIND}]
+        for before, after in zip(chain, chain[1:]):
+            if after.street != before.street:
+                history.append({'type': 'DEAL', 'street': STREET_NAMES[after.street]})
+                continue
+            seat = before.active
+            top = max(before.pips)
+            move = {'player': names[seat]}
+            if after.folded[seat] and not before.folded[seat]:
+                move['type'] = 'FOLD'
+            elif after.pips[seat] == before.pips[seat]:
+                move['type'] = 'CHECK'
+            elif after.pips[seat] <= top:
+                move['type'] = 'CALL'
             else:
-                return FoldAction()
+                move['type'] = 'BET' if top == 0 else 'RAISE'
+                move['amount'] = after.pips[seat]
+            history.append(move)
+        return history
+
+    def send(self, round_state, status, deltas=None, **extra):
+        live = round_state.live()
+        shown = live if status == 'round_over' and len(live) > 1 else []  # showdown
+        seats = []
+        for index, seat in enumerate(self.seats):
+            human = seat.name[:-1] == HUMAN_TEAM
+            seats.append({
+                'name': seat.name,
+                'team': seat.name[:-1],
+                'human': human,
+                'position': POSITIONS[index],
+                'stack': round_state.stacks[index],
+                'pip': round_state.pips[index],
+                'contribution': round_state.contributions[index],
+                'folded': round_state.folded[index],
+                'cards': [str(card) for card in round_state.hands[index]]
+                         if human or index in shown else ['??', '??'],
+                'bankroll': seat.bankroll,
+                'delta': deltas[index] if deltas else None,
+            })
+        message = {
+            'status': status,
+            'round_num': self.round_num,
+            'num_rounds': self.engine.NUM_ROUNDS,
+            'street_name': STREET_NAMES[round_state.street],
+            'board_cards': [str(card) for card in round_state.board],
+            'pot': sum(round_state.contributions),
+            'active_seat': None if status == 'round_over' else round_state.active,
+            'seats': seats,
+            'team_bankrolls': {team: self.team_bankroll(team) for team in ('A', 'B')},
+            'move_history': self.action_history(round_state),
+        }
+        message.update(extra)
+        self.db_game.send_message(message)
