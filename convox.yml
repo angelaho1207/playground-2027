@@ -1,0 +1,50 @@
+resources:
+  cache:
+    type: redis
+services:
+  web:
+    resources:
+      - cache
+    build:
+      path: .
+      manifest: ./dockerfiles/web/Dockerfile
+    command: python manage.py runserver
+    domain: playground.pokerbots.org
+    environment:
+      - PRODUCTION=True
+      - WEB=True
+      - SQLALCHEMY_DATABASE_URI
+      - CELERY_BROKER_URL
+      - MESSAGE_QUEUE_URL
+      - REDIS_URL
+      - SECRET_KEY
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - S3_REGION
+      - S3_BUCKET
+      - ADMIN_PASSWORD
+    port: https:5001
+    scale:
+      cpu: 256
+      memory: 256
+  worker:
+    resources:
+      - cache
+    build:
+      path: .
+      manifest: ./dockerfiles/worker/Dockerfile
+    command: celery -A server.celery_app worker --loglevel=info --concurrency=1 --without-gossip
+    environment:
+      - PRODUCTION=True
+      - SQLALCHEMY_DATABASE_URI
+      - CELERY_BROKER_URL
+      - MESSAGE_QUEUE_URL
+      - REDIS_URL
+      - SECRET_KEY
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - S3_REGION
+      - S3_BUCKET
+    scale:
+      cpu: 256
+      memory: 500
