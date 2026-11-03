@@ -134,12 +134,12 @@ def _bot_environment():
     os.environ.update(hidden)
 
 
-def load_engine(bot_dir):
+def load_engine(bot_dir, week):
   '''
   Imports a fresh copy of the engine, which reads its settings with `from config import *`.
   '''
   config = types.ModuleType('config')
-  exec(render_template('config.txt', bot_path=bot_dir), config.__dict__)
+  exec(render_template('config.txt', bot_path=bot_dir, week=week), config.__dict__)
   sys.modules['config'] = config
   spec = importlib.util.spec_from_file_location('engine', ENGINE_PATH)
   engine = importlib.util.module_from_spec(spec)
@@ -150,7 +150,7 @@ def load_engine(bot_dir):
 def run_bot_and_game(game, tmp_dir, bot_dir):
   game_dir = os.path.join(tmp_dir, 'game')
   os.mkdir(game_dir)
-  engine = load_engine(bot_dir)
+  engine = load_engine(bot_dir, game.week)
   game.send_message({
     'status': 'starting_game'
   })

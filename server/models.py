@@ -40,11 +40,13 @@ class Game(db.Model):
   bot = db.relationship("Bot", foreign_keys=bot_id)
   uuid = db.Column(db.String(128), nullable=False, index=True, unique=True)
   status = db.Column(db.Enum(GameStatus), nullable=False)
+  week = db.Column(db.Integer, nullable=False, server_default='1')  # which week's Homie Hold'em rules
 
   last_message_json = db.Column(db.Text)
 
-  def __init__(self, bot):
+  def __init__(self, bot, week):
     self.bot = bot
+    self.week = week
     self.status = GameStatus.created
     self.uuid = str(uuid.uuid4())
 
@@ -65,6 +67,7 @@ class Game(db.Model):
         'name': self.bot.name
       },
       'status': self.status.value,
+      'week': self.week,
       'last_message': self.last_message
     }
 

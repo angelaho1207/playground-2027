@@ -18,8 +18,15 @@ import { withRouter } from "react-router-dom";
 
 import { SocketConsumer } from "./SocketContext";
 
-// Seats sit clockwise A1, B1, A2, B2, so teammates face each other.
-const TABLE_LAYOUT = { top: "A2", left: "B1", right: "B2", bottom: "A1" };
+// Where each table position goes on screen, clockwise from A1 at the bottom.
+// Until Week 3 the table is A1, B1, A2, B2, so teammates face each other.
+const TABLE_SPOTS = ["bottom", "left", "top", "right"];
+
+const WEEK_NAMES = {
+  1: "Week 1: base game",
+  2: "Week 2: one combined hand per team",
+  3: "Week 3: combined hands and random seating",
+};
 
 const BOT_DELAY_OPTIONS = [
   { key: 0, text: "Instant", value: 0 },
@@ -56,6 +63,8 @@ const PlaceholderCard = () => {
 
 const Card = (props) => {
   const card = props.card;
+  const highlighted = props.highlighted || false;
+  const onClick = props.onClick;
 
   if (card === "??") {
     return (
@@ -65,8 +74,15 @@ const Card = (props) => {
   return (
     <img
       src={`/cards/${card[0] + card[1].toLowerCase()}.jpg`}
-      style={cardStyle}
+      style={{
+        ...cardStyle,
+        cursor: onClick ? "pointer" : "default",
+        boxShadow: highlighted ? "0 0 0 3px #2185d0" : "none",
+        transform: highlighted ? "translateY(-6px)" : "none",
+        transition: "all 0.2s ease",
+      }}
       alt={card}
+      onClick={onClick}
     />
   );
 };
@@ -235,9 +251,12 @@ class Game extends Component {
     );
   }
 
-  renderSeat(seatName) {
+  renderSeat(spot) {
     const message = this.state.game.last_message;
-    const seatIndex = message.seats.findIndex((seat) => seat.name === seatName);
+    const bottom = message.seats.find((seat) => seat.name === "A1").table_position;
+    const seatIndex = message.seats.findIndex(
+      (seat) => TABLE_SPOTS[(seat.table_position - bottom + 4) % 4] === spot
+    );
     const seat = message.seats[seatIndex];
     const isActive = message.active_seat === seatIndex;
 
@@ -265,9 +284,17 @@ class Game extends Component {
         </Header>
         <div>
           {seat.cards.map((card, i) => (
-            <Card card={card} key={i} />
+            <Card card={card} key={i} highlighted={seat.submitted === card} />
           ))}
         </div>
+        {seat.hand_name && (
+          <div style={{ marginTop: "0.5em" }}>
+            {message.week >= 2 && (
+              <span>Submitted {seat.submitted || "no card"} · Team hand: </span>
+            )}
+            <b>{seat.hand_name}</b>
+          </div>
+        )}
         <div style={{ marginTop: "0.5em" }}>
           Stack: <b>{seat.stack}</b>
           {seat.pip > 0 && (
@@ -315,17 +342,17 @@ class Game extends Component {
       <Grid verticalAlign="middle" stackable>
         <Grid.Row>
           <Grid.Column width={4} />
-          <Grid.Column width={8}>{this.renderSeat(TABLE_LAYOUT.top)}</Grid.Column>
+          <Grid.Column width={8}>{this.renderSeat("top")}</Grid.Column>
           <Grid.Column width={4} />
         </Grid.Row>
         <Grid.Row>
-          <Grid.Column width={4}>{this.renderSeat(TABLE_LAYOUT.left)}</Grid.Column>
+          <Grid.Column width={4}>{this.renderSeat("left")}</Grid.Column>
           <Grid.Column width={8}>{this.renderBoard()}</Grid.Column>
-          <Grid.Column width={4}>{this.renderSeat(TABLE_LAYOUT.right)}</Grid.Column>
+          <Grid.Column width={4}>{this.renderSeat("right")}</Grid.Column>
         </Grid.Row>
         <Grid.Row>
           <Grid.Column width={4} />
-          <Grid.Column width={8}>{this.renderSeat(TABLE_LAYOUT.bottom)}</Grid.Column>
+          <Grid.Column width={8}>{this.renderSeat("bottom")}</Grid.Column>
           <Grid.Column width={4} />
         </Grid.Row>
       </Grid>
@@ -390,6 +417,38 @@ class Game extends Component {
     );
   }
 
+  handleSubmission = (cardIndex) => {
+    this.props.socket.emit("game_action", this.props.match.params.id, {
+      type: "SUBMIT",
+      card_index: cardIndex,
+      decision_id: this.state.game.last_message.decision_id,
+    });
+  };
+
+  renderSubmission() {
+    const message = this.state.game.last_message;
+    const seat = message.seats[message.active_seat];
+    return (
+      <div style={{ textAlign: "center" }}>
+        <Header>
+          Showdown: pick {seat.name}'s card for your team's hand
+          <Header.Subheader>
+            Your team's hand is the best five cards from the board and the cards
+            your live players submit. Click a card, or submit none.
+          </Header.Subheader>
+        </Header>
+        <div>
+          {seat.cards.map((card, i) => (
+            <Card card={card} key={i} onClick={() => this.handleSubmission(i)} />
+          ))}
+        </div>
+        <Button basic style={{ marginTop: "1em" }} onClick={() => this.handleSubmission(null)}>
+          Submit no card
+        </Button>
+      </div>
+    );
+  }
+
   renderWaiting() {
     const message = this.state.game.last_message;
     const seat = message.seats[message.active_seat];
@@ -450,15 +509,17 @@ class Game extends Component {
       message.status === "round_over" ? message.new_team_bankrolls : message.team_bankrolls;
     const headers = {
       get_action: ["Your move!", "Select an action below"],
+      get_submission: ["Showdown!", "Choose the cards for your team's hand"],
       bot_action: ["Bots are playing", "Their actions play out at the speed you choose"],
       round_over: [`Hand ${message.round_num} is over`, "Click next hand to continue!"],
     };
     return (
-      <Segment color={message.status === "get_action" ? "yellow" : "black"}>
+      <Segment color={["get_action", "get_submission"].includes(message.status) ? "yellow" : "black"}>
         <Header dividing style={{ textAlign: "center" }}>
           {headers[message.status][0]}
           <Header.Subheader>
-            Hand {message.round_num} of {message.num_rounds} ·{" "}
+            {WEEK_NAMES[message.week]} · Hand {message.round_num} of {message.num_rounds}
+            {message.week >= 3 && ` (hand ${message.orbit_hand} of 4 in this seating)`} ·{" "}
             {headers[message.status][1]}
           </Header.Subheader>
           <Button
@@ -503,6 +564,7 @@ class Game extends Component {
               {this.renderTable()}
               <Divider />
               {message.status === "get_action" && this.renderAction()}
+              {message.status === "get_submission" && this.renderSubmission()}
               {message.status === "bot_action" && this.renderWaiting()}
               {message.status === "round_over" && this.renderResult()}
             </Grid.Column>
@@ -539,7 +601,7 @@ class Game extends Component {
           </div>
         </Segment>
       );
-    } else if (["get_action", "bot_action", "round_over"].includes(message.status)) {
+    } else if (["get_action", "get_submission", "bot_action", "round_over"].includes(message.status)) {
       return this.renderHand();
     }
   }

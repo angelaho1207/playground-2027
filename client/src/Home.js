@@ -4,6 +4,12 @@ import { withRouter } from 'react-router-dom';
 
 import { SocketConsumer } from './SocketContext';
 
+const WEEK_OPTIONS = [
+  { key: 1, value: 1, text: "Week 1: base game" },
+  { key: 2, value: 2, text: "Week 2: one combined hand per team" },
+  { key: 3, value: 3, text: "Week 3: combined hands and random seating" },
+];
+
 class Home extends Component {
   constructor(props) {
     super(props);
@@ -12,6 +18,7 @@ class Home extends Component {
       teams: null,
       selectedTeam: null,
       selectedBot: null,
+      selectedWeek: 1,
       loadingChallenge: false,
     }
   }
@@ -61,7 +68,7 @@ class Home extends Component {
     this.setState({
       loadingChallenge: true
     })
-    this.props.socket.emit('create_game', this.state.selectedBot, (gameUuid) => {
+    this.props.socket.emit('create_game', this.state.selectedBot, this.state.selectedWeek, (gameUuid) => {
       this.setState({
         loadingChallenge: false
       })
@@ -79,8 +86,8 @@ class Home extends Component {
           </Header>
           <p>
             Your team sits at a table of four: you play both of your team's seats,
-            which sit across from each other, and two copies of the bot you
-            choose play the other two. Select a bot below, and you'll be connected.
+            and two copies of the bot you choose play the other two. Pick a bot and
+            the week whose rules you want to play, and you'll be connected.
           </p>
           { this.state.teams == null && (
             <Segment placeholder>
@@ -113,6 +120,12 @@ class Home extends Component {
                   disabled={this.state.selectedTeam == null}
                   onChange={this.handleChange}
                   value={this.state.selectedBot} />
+                <Form.Select
+                  name='selectedWeek'
+                  options={WEEK_OPTIONS}
+                  label="Rules"
+                  onChange={this.handleChange}
+                  value={this.state.selectedWeek} />
                 <div style={{ textAlign: "center" }}>
                   <Button
                     color='green'

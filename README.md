@@ -1,15 +1,16 @@
 # playground
 Play against your pokerbot online!
 
-The 2027 variant is Homie Hold'em: four seats, two per team, with teammates
-sitting across from each other. In the playground the human plays both of team
-A's seats (A1 and A2) against two copies of the chosen bot (B1 and B2). Games
-are 100 hands, with 200 chips per seat each hand.
+The 2027 variant is Homie Hold'em: four seats, two per team. In the playground
+the human plays both of team A's seats (A1 and A2) against two copies of the
+chosen bot (B1 and B2), under the rules of Week 1, 2 or 3, picked on the home
+page. Games are 100 hands, with 200 chips per seat each hand.
 
-The worker imports the stock engine (`deps/engine-2027/engine.py`, copied from
-scrimmage's `game/engine.py`) and drives its `Game.run_round` from
-`server/bot.py`, which relays the human seats' decisions and each bot action to
-the browser.
+The worker imports the engine (`deps/engine-2027/engine.py`, scrimmage's
+`game/engine.py` plus Weeks 2 and 3; see its README) and drives its
+`Game.run_round` from `server/bot.py`, which relays the human seats' decisions
+and each bot action to the browser. The `games.week` column needs the migration
+in `migrations/versions/b2f7c41d9a63_.py` on an existing database.
 
 # Instructions to run (similar to scrimmage):
 To run locally (cd into directory first), do:

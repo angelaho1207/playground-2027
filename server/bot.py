@@ -1,10 +1,10 @@
 '''
 Plays a Homie Hold'em game between a human in the browser and a bot.
 
-The human's team is A and controls both of its seats, A1 and A2, which sit
-opposite each other. The selected bot plays both B seats as ordinary engine
-players. The worker drives the stock engine's Game.run_round itself, so every
-query reaches us with the full RoundState.
+The human's team is A and controls both of its seats, A1 and A2. The selected
+bot plays both B seats as ordinary engine players. The worker drives the
+engine's Game.run_round itself, so every query reaches us with the full
+RoundState. The engine's WEEK picks the rules; see deps/engine-2027/engine.py.
 '''
 import json
 
@@ -31,6 +31,9 @@ class HumanSeat():
             return self.table.engine.CheckAction()
         return self.table.get_human_action(round_state)
 
+    def query_submission(self, round_state, player_message, game_log):
+        return self.table.get_human_submission(round_state, self.table.seats.index(self))
+
 
 class BotSeat():
     '''
@@ -49,6 +52,9 @@ class BotSeat():
             self.table.handle_bot_action(round_state, action)
         return action
 
+    def query_submission(self, round_state, player_message, game_log):
+        return self.player.query_submission(round_state, player_message, game_log)
+
 
 class Table():
     '''
@@ -64,6 +70,8 @@ class Table():
         # teams alternate around the table: A1 B1 A2 B2
         self.seats = [HumanSeat(self, 'A1'), BotSeat(self, self.bots[0]),
                       HumanSeat(self, 'A2'), BotSeat(self, self.bots[1])]
+        # seats in clockwise order around the table, from the orbit's first small blind
+        self.table_order = list(self.seats)
         self.round_num = 0
         self.round_over_sent = False
         self.decision_id = 0
@@ -83,6 +91,10 @@ class Table():
         for round_num in range(1, self.engine.NUM_ROUNDS + 1):
             self.round_num = round_num
             self.round_over_sent = False
+            seats = self.game.seat_players(self.seats, round_num)
+            if seats is not self.seats:  # a new orbit's seating
+                self.seats = seats
+                self.table_order = list(seats)
             self.game.run_round(self.seats)
             if self.done:
                 break
@@ -134,6 +146,28 @@ class Table():
             if action is not None:
                 return action
 
+    def get_human_submission(self, round_state, seat):
+        '''
+        Asks the browser which card a human seat submits at a Week 2+ showdown.
+        '''
+        if self.done:
+            return None
+        self.decision_id += 1
+        self.send(round_state, 'get_submission', decision_id=self.decision_id, active_seat=seat,
+                  street_name='Showdown')
+        while True:
+            data = self.wait_for_message()
+            if data is None:
+                return None
+            try:
+                move = json.loads(data)
+            except ValueError:
+                continue  # a stray next_hand
+            if move.get('decision_id') != self.decision_id or move.get('type') != 'SUBMIT':
+                continue
+            if move.get('card_index') in (0, 1, None):
+                return move.get('card_index')
+
     def parse_move(self, round_state, move):
         engine = self.engine
         legal_actions = round_state.legal_actions()
@@ -166,9 +200,24 @@ class Table():
         if self.round_over_sent or self.done:
             return
         self.round_over_sent = True
+        engine = self.engine
+        round_state = terminal_state.previous_state
         deltas = terminal_state.deltas
+        submitted = terminal_state.submitted
+        live = round_state.live()
+        hand_names = [None] * engine.NUM_PLAYERS
+        if engine.WEEK == 1 and len(live) > 1:  # showdown
+            for seat in live:
+                hand_names[seat] = engine.pkrbot.handtype(engine.pkrbot.evaluate(round_state.runout + round_state.hands[seat]))
+        elif submitted is not None:  # team showdown
+            for seat in live:
+                cards = [round_state.hands[mate][submitted[mate]] for mate in live
+                         if self.seats[mate].name[:-1] == self.seats[seat].name[:-1] and submitted[mate] is not None]
+                hand_names[seat] = engine.pkrbot.handtype(engine.pkrbot.evaluate(round_state.runout + cards))
         team_delta = sum(delta for seat, delta in zip(self.seats, deltas) if seat.name[:-1] == HUMAN_TEAM)
-        self.send(terminal_state.previous_state, 'round_over', deltas=deltas,
+        self.send(round_state, 'round_over', deltas=deltas,
+                  shown=[seat for seat in live if hand_names[seat] is not None],
+                  submitted=submitted, hand_names=hand_names,
                   result='win' if team_delta > 0 else ('loss' if team_delta < 0 else 'tie'),
                   team_delta=team_delta,
                   new_team_bankrolls={team: self.team_bankroll(team) + sum(
@@ -229,9 +278,11 @@ class Table():
             history.append(move)
         return history
 
-    def send(self, round_state, status, deltas=None, **extra):
-        live = round_state.live()
-        shown = live if status == 'round_over' and len(live) > 1 else []  # showdown
+    def send(self, round_state, status, deltas=None, shown=(), submitted=None, hand_names=None, **extra):
+        '''
+        Sends the browser the table as the human sees it. shown lists the
+        seats whose cards were revealed at showdown.
+        '''
         seats = []
         for index, seat in enumerate(self.seats):
             human = seat.name[:-1] == HUMAN_TEAM
@@ -240,6 +291,7 @@ class Table():
                 'team': seat.name[:-1],
                 'human': human,
                 'position': POSITIONS[index],
+                'table_position': self.table_order.index(seat),  # clockwise
                 'stack': round_state.stacks[index],
                 'pip': round_state.pips[index],
                 'contribution': round_state.contributions[index],
@@ -248,10 +300,16 @@ class Table():
                          if human or index in shown else ['??', '??'],
                 'bankroll': seat.bankroll,
                 'delta': deltas[index] if deltas else None,
+                'submitted': None if submitted is None or submitted[index] is None
+                             else str(round_state.hands[index][submitted[index]]),
+                'hand_name': hand_names[index] if hand_names else None,
             })
         message = {
             'status': status,
+            'week': self.engine.WEEK,
             'round_num': self.round_num,
+            # hands into the orbit, which reseats the table from Week 3
+            'orbit_hand': (self.round_num - 1) % self.engine.NUM_PLAYERS + 1,
             'num_rounds': self.engine.NUM_ROUNDS,
             'street_name': STREET_NAMES[round_state.street],
             'board_cards': [str(card) for card in round_state.board],

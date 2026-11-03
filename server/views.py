@@ -88,10 +88,15 @@ def on_request_bots(*args, **kwargs):
   return result
 
 
+WEEKS = (1, 2, 3)
+
+
 @socketio.on('create_game')
-def on_create_game(bot_id):
+def on_create_game(bot_id, week=1):
+  if week not in WEEKS:
+    return None
   bot = Bot.query.get(bot_id)
-  game = Game(bot)
+  game = Game(bot, week)
   db.session.add(game)
   db.session.commit()
   play_live_game_task.delay(game.id)

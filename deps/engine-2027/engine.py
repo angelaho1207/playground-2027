@@ -5,12 +5,22 @@ DO NOT REMOVE, RENAME, OR EDIT THIS FILE
 Homie Hold'em: no-limit Texas hold'em at a table of four. Each team's bot plays
 as two identical replicas in alternating seats (A1 B1 A2 B2), and a team's
 score is the sum of its replicas' bankrolls.
+
+WEEK in config.py picks the rules, and each week keeps the ones before it:
+1. The base game above.
+2. At showdown each team plays one combined hand: every live player submits
+   one of its hole cards, or none, and the team's hand is the best five
+   cards from the board plus those submissions. A hand also ends as soon as
+   only one team has players left.
+3. Seating is shuffled every orbit of NUM_PLAYERS hands, so teammates may
+   sit next to each other. Each player is told its teammates' seats.
 '''
 from collections import namedtuple
 from threading import Thread
 from queue import Queue
 import time
 import json
+import random
 import subprocess
 import socket
 import pkrbot ###import eval7, but better
@@ -20,13 +30,22 @@ import os
 sys.path.append(os.getcwd())
 from config import *
 
+try:
+    WEEK
+except NameError:  # config files from before Week 2 don't set it
+    WEEK = 1
+
 FoldAction = namedtuple('FoldAction', [])
 CallAction = namedtuple('CallAction', [])
 CheckAction = namedtuple('CheckAction', [])
 # we coalesce BetAction and RaiseAction for convenience
 RaiseAction = namedtuple('RaiseAction', ['amount'])
 
-TerminalState = namedtuple('TerminalState', ['deltas', 'previous_state'])
+# submitted[seat] is the index of the hole card a seat submitted at a Week 2+
+# showdown, or None; submitted is None for a round that had no such showdown
+TerminalState = namedtuple('TerminalState', ['deltas', 'previous_state', 'submitted'], defaults=[None])
+# the river's betting is over and the live players must submit cards (Week 2+)
+SubmissionState = namedtuple('SubmissionState', ['previous_state'])
 
 REPLICAS = 2  # copies of each team's bot at the table
 NUM_PLAYERS = 2 * REPLICAS
@@ -39,26 +58,31 @@ STATUS = lambda pairs: ''.join(PVALUE(name, value) for name, value in pairs)
 
 # Seats are renumbered every round, counting from the small blind:
 # 0 small blind, 1 big blind, 2 first to act preflop, 3 dealer.
-# Teams alternate around the table, so teammates are always 2 seats apart.
+# Until Week 3, teams alternate around the table, so teammates are always 2
+# seats apart.
 #
 # Socket encoding scheme:
 #
 # T#.### the player's game clock
 # P# the player's seat this round
+# M#,# the player's teammates' seats this round (Week 3+)
 # H**,** the player's hand in common format
 # F a fold action in the round history
 # C a call action in the round history
 # K a check action in the round history
 # R### a raise action in the round history (the raiser's new pip)
 # B**,**,**,**,** the board cards in common format
+# S a request to submit a hole card for the team's hand (Week 2+)
 # O#:**,** the hand shown by seat # at showdown
+# U#:** the card seat # submitted at showdown, or U#: for none (Week 2+)
 # A#,#,#,# every seat's bankroll delta from the round, in seat order
 # Q game over
 #
 # Clauses are separated by spaces
 # Messages end with '\n'
 # The engine expects a response of K at the end of the round as an ack,
-# otherwise a response which encodes the player's action
+# S0 or S1 (the index of the card in the player's hand) or S (no card) to a
+# submission request, otherwise a response which encodes the player's action
 # Action history is sent once, including the player's actions
 
 
@@ -137,10 +161,49 @@ class RoundState(namedtuple('_RoundState', ['active', 'street', 'pips', 'stacks'
             floor = cap
         return TerminalState([w - c for w, c in zip(winnings, contributions)], self)
 
+    def settle_teams(self, teams, submitted):
+        '''
+        Pays out a Week 2+ showdown. teams[seat] names each seat's team. A
+        team's hand is the board plus every card its live players submitted.
+        Each pot goes to the best hand among the teams with a live seat that
+        paid into all of it, and is shared among that team's seats that did;
+        tied teams split it. Odd chips go to the team, then the seat, nearest
+        the small blind.
+        '''
+        contributions = self.contributions
+        live = self.live()
+        team_cards = {}
+        for seat in live:
+            cards = team_cards.setdefault(teams[seat], [])
+            if submitted[seat] is not None:
+                cards.append(self.hands[seat][submitted[seat]])
+        scores = {team: pkrbot.evaluate(self.runout + cards) for team, cards in team_cards.items()}
+        winnings = [0] * NUM_PLAYERS
+        levels = sorted({contributions[seat] for seat in live})
+        floor = 0
+        for i, level in enumerate(levels):
+            cap = level if i + 1 < len(levels) else max(contributions)
+            pot = sum(min(c, cap) - min(c, floor) for c in contributions)
+            eligible = [seat for seat in live if contributions[seat] >= level]
+            eligible_teams = list(dict.fromkeys(teams[seat] for seat in eligible))
+            best = max(scores[team] for team in eligible_teams)
+            winners = [team for team in eligible_teams if scores[team] == best]
+            team_share, team_odd = divmod(pot, len(winners))
+            for j, team in enumerate(winners):
+                seats = [seat for seat in eligible if teams[seat] == team]
+                share, odd = divmod(team_share + (j < team_odd), len(seats))
+                for k, seat in enumerate(seats):
+                    winnings[seat] += share + (k < odd)
+            floor = cap
+        return TerminalState([w - c for w, c in zip(winnings, contributions)], self, submitted)
+
     def showdown(self):
         '''
-        Compares the live players' hands and computes the final payoffs.
+        Compares the live players' hands and computes the final payoffs. From
+        Week 2 the players must first submit their cards.
         '''
+        if WEEK >= 2:
+            return SubmissionState(self)
         return self.settle([None if self.folded[seat] else pkrbot.evaluate(self.runout + self.hands[seat])
                             for seat in range(NUM_PLAYERS)])
 
@@ -393,6 +456,54 @@ class Player():
                 game_log.append(self.name + ' response misformatted: ' + str(clause))
         return CheckAction() if CheckAction in legal_actions else FoldAction()
 
+    def query_submission(self, round_state, player_message, game_log):
+        '''
+        Requests the index of the hole card to submit for the team's hand at
+        a Week 2+ showdown, or None for no card.
+
+        A bot that sends a misformatted response, disconnects or runs out of
+        time submits no card.
+        '''
+        if self.socketfile is not None and self.game_clock > 0.:
+            clause = ''
+            try:
+                player_message[0] = 'T{:.3f}'.format(self.game_clock)
+                message = ' '.join(player_message + ['S']) + '\n'
+                del player_message[1:]  # do not send redundant action history
+                start_time = time.perf_counter()
+                self.socketfile.write(message)
+                self.socketfile.flush()
+                line = self.socketfile.readline()
+                end_time = time.perf_counter()
+                if not line:  # the bot closed the connection
+                    raise ConnectionError
+                clause = line.strip()
+                if ENFORCE_GAME_CLOCK and self.path != r"./player_chatbot":
+                    self.game_clock -= end_time - start_time
+                if self.game_clock <= 0.:
+                    raise socket.timeout
+                if clause[0] != 'S':
+                    raise ValueError
+                if clause == 'S':
+                    return None
+                index = int(clause[1:])
+                if index in (0, 1):
+                    return index
+                game_log.append(self.name + ' attempted to submit card ' + str(index))
+            except socket.timeout:
+                error_message = self.name + ' ran out of time'
+                game_log.append(error_message)
+                print(error_message)
+                self.game_clock = 0.
+            except OSError:
+                error_message = self.name + ' disconnected'
+                game_log.append(error_message)
+                print(error_message)
+                self.game_clock = 0.
+            except (IndexError, ValueError):
+                game_log.append(self.name + ' response misformatted: ' + str(clause))
+        return None
+
 
 class Game():
     '''
@@ -415,6 +526,10 @@ class Game():
             for seat, player in enumerate(players):
                 self.log.append('{} dealt {}'.format(player.name, PCARDS(round_state.hands[seat])))
                 self.player_messages[seat] = ['T0.', 'P' + str(seat), 'H' + CCARDS(round_state.hands[seat])]
+                if WEEK >= 3:
+                    teammates = [other for other, mate in enumerate(players)
+                                 if other != seat and mate.name[:-1] == player.name[:-1]]
+                    self.player_messages[seat].insert(2, 'M' + ','.join(map(str, teammates)))
         else:
             board = round_state.board
             self.log.append(STREET_NAMES[round_state.street] + ' ' + PCARDS(board) +
@@ -449,12 +564,20 @@ class Game():
         '''
         previous_state = round_state.previous_state
         live = previous_state.live()
-        if len(live) > 1:  # showdown
+        showdown = len(live) > 1 if WEEK == 1 else round_state.submitted is not None
+        if showdown:
             for seat in live:
                 self.log.append('{} shows {}'.format(players[seat].name, PCARDS(previous_state.hands[seat])))
                 for viewer, message in enumerate(self.player_messages):
                     if viewer != seat:
                         message.append('O{}:{}'.format(seat, CCARDS(previous_state.hands[seat])))
+            if round_state.submitted is not None:
+                for seat in live:
+                    index = round_state.submitted[seat]
+                    card = '' if index is None else str(previous_state.hands[seat][index])
+                    self.log.append('{} submitted {}'.format(players[seat].name, card or 'no card'))
+                    for message in self.player_messages:
+                        message.append('U{}:{}'.format(seat, card))
         for player, delta in zip(players, round_state.deltas):
             self.log.append('{} awarded {}'.format(player.name, delta))
         for message in self.player_messages:
@@ -472,8 +595,12 @@ class Game():
         stacks = [STARTING_STACK - pip for pip in pips]
         round_state = RoundState(2 % NUM_PLAYERS, 0, pips, stacks, list(pips), (-1,) * NUM_PLAYERS,
                                  (False,) * NUM_PLAYERS, BIG_BLIND, hands, cards[2 * NUM_PLAYERS:], None)
+        teams = [player.name[:-1] for player in players]
         street = None
         while not isinstance(round_state, TerminalState):
+            if isinstance(round_state, SubmissionState):
+                round_state = self.run_submissions(players, round_state.previous_state)
+                continue
             if round_state.street != street:
                 street = round_state.street
                 self.log_round_state(players, round_state)
@@ -485,10 +612,32 @@ class Game():
             action = player.query(round_state, self.player_messages[active], self.log)
             self.log_action(player.name, action, max(round_state.pips) == 0)
             round_state = round_state.proceed(action)
+            if WEEK >= 2 and isinstance(round_state, (RoundState, SubmissionState)):
+                state = round_state.previous_state if isinstance(round_state, SubmissionState) else round_state
+                if len({teams[seat] for seat in state.live()}) == 1:  # one team left: it takes the pot
+                    round_state = state.settle([None if out else 0 for out in state.folded])
         self.log_terminal_state(players, round_state)
         for player, player_message, delta in zip(players, self.player_messages, round_state.deltas):
             player.query(round_state, player_message, self.log)
             player.bankroll += delta
+
+    def run_submissions(self, players, round_state):
+        '''
+        Asks each live player for its card, privately, and pays out the team showdown.
+        '''
+        submitted = [None] * NUM_PLAYERS
+        for seat in round_state.live():
+            submitted[seat] = players[seat].query_submission(round_state, self.player_messages[seat], self.log)
+        return round_state.settle_teams([player.name[:-1] for player in players], submitted)
+
+    def seat_players(self, players, round_num):
+        '''
+        Returns the seating for a round, given the last round's. From Week 3
+        every orbit starts with a new random seating and button.
+        '''
+        if WEEK >= 3 and round_num % NUM_PLAYERS == 1:
+            return random.sample(players, len(players))
+        return players
 
     def run(self):
         '''
@@ -508,6 +657,7 @@ class Game():
         for player in players:
             player.run()
         for round_num in range(1, NUM_ROUNDS + 1):
+            players = self.seat_players(players, round_num)
             self.log.append('')
             self.log.append('Round #' + str(round_num) + STATUS((p.name, p.bankroll) for p in players))
             self.run_round(players)
